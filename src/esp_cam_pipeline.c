@@ -292,9 +292,10 @@ static void frame_cb(uint8_t *camera_buf, uint32_t camera_width,
         if (cam_ppa_dur > cam_ppa_max) cam_ppa_max = cam_ppa_dur;
         cam_ppa_count++;
         if (ppa_t1 - cam_ppa_last_log > 2000000) {  /* every 2s */
-            ESP_LOGI(TAG, "CAM PPA: avg=%lld us  max=%lld us  n=%d",
-                     (long long)(cam_ppa_sum / cam_ppa_count),
-                     (long long)cam_ppa_max, cam_ppa_count);
+            /* %d (not %lld): nano-printf has no 64-bit conversion; us fit in int. */
+            ESP_LOGI(TAG, "CAM PPA: avg=%d us  max=%d us  n=%d",
+                     (int)(cam_ppa_sum / cam_ppa_count),
+                     (int)cam_ppa_max, cam_ppa_count);
             cam_ppa_sum = 0;
             cam_ppa_max = 0;
             cam_ppa_count = 0;
