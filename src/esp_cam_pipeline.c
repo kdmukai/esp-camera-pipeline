@@ -143,6 +143,15 @@ static void frame_cb(uint8_t *camera_buf, uint32_t camera_width,
         return;
     }
 
+    /* Frozen: hold the current front frame on screen (and stable for a
+     * consumer to latch). Skip all processing — no back-buffer selection,
+     * no transform, no display push, no promote — so both the displayed
+     * frame and front_buffer stay put until unfrozen. */
+    if (p->frozen) {
+        __atomic_sub_fetch(&p->active_frame_operations, 1, __ATOMIC_SEQ_CST);
+        return;
+    }
+
 #ifdef CONFIG_CAM_PIPELINE_DEBUG
     __atomic_add_fetch(&p->camera_frames, 1, __ATOMIC_RELAXED);
     log_debug_metrics(p);
@@ -323,6 +332,7 @@ static void frame_cb(uint8_t *camera_buf, uint32_t camera_width,
     xSemaphoreTake(p->buffer_mutex, portMAX_DELAY);
     p->front_buffer = back;
     p->front_consumed = false;
+    p->frame_generation++;  // new front frame available to consumers
     xSemaphoreGive(p->buffer_mutex);
 
     __atomic_sub_fetch(&p->active_frame_operations, 1, __ATOMIC_SEQ_CST);
@@ -330,7 +340,8 @@ static void frame_cb(uint8_t *camera_buf, uint32_t camera_width,
 
 /* --- Public API --- */
 
-const uint8_t *cam_pipeline_lock_frame(cam_pipeline_handle_t handle) {
+const uint8_t *cam_pipeline_lock_frame_gen(cam_pipeline_handle_t handle,
+                                           uint32_t *generation) {
     if (!handle || handle->closing || handle->frame_access_paused) {
         return NULL;
     }
@@ -348,6 +359,11 @@ const uint8_t *cam_pipeline_lock_frame(cam_pipeline_handle_t handle) {
 
     handle->locked_buffer = handle->front_buffer;
     handle->front_consumed = true;
+    /* Report the locked frame's generation atomically with the lock, so a
+     * consumer can detect (and skip) an unchanged frame it already processed. */
+    if (generation) {
+        *generation = handle->frame_generation;
+    }
     xSemaphoreGive(handle->buffer_mutex);
 
 #ifdef CONFIG_CAM_PIPELINE_DEBUG
@@ -358,6 +374,10 @@ const uint8_t *cam_pipeline_lock_frame(cam_pipeline_handle_t handle) {
 #endif
 
     return handle->locked_buffer;
+}
+
+const uint8_t *cam_pipeline_lock_frame(cam_pipeline_handle_t handle) {
+    return cam_pipeline_lock_frame_gen(handle, NULL);
 }
 
 void cam_pipeline_release_frame(cam_pipeline_handle_t handle) {
@@ -597,6 +617,20 @@ void cam_pipeline_pause_frame_access(cam_pipeline_handle_t handle) {
 void cam_pipeline_resume_frame_access(cam_pipeline_handle_t handle) {
     if (handle) {
         handle->frame_access_paused = false;
+    }
+}
+
+/* --- Display freeze --- */
+
+void cam_pipeline_freeze(cam_pipeline_handle_t handle) {
+    if (handle) {
+        handle->frozen = true;
+    }
+}
+
+void cam_pipeline_unfreeze(cam_pipeline_handle_t handle) {
+    if (handle) {
+        handle->frozen = false;
     }
 }
 

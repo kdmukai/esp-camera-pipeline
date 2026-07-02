@@ -61,6 +61,16 @@ void cam_pipeline_destroy(cam_pipeline_handle_t handle);
 const uint8_t *cam_pipeline_lock_frame(cam_pipeline_handle_t handle);
 
 /**
+ * Like cam_pipeline_lock_frame(), but also reports the locked frame's
+ * generation — a monotonic counter incremented on each new camera frame.
+ * A consumer faster than the camera can compare it to the last generation it
+ * processed and skip re-processing an unchanged frame. `generation` may be
+ * NULL (equivalent to cam_pipeline_lock_frame()).
+ */
+const uint8_t *cam_pipeline_lock_frame_gen(cam_pipeline_handle_t handle,
+                                           uint32_t *generation);
+
+/**
  * Release a previously locked frame buffer back to the pool.
  */
 void cam_pipeline_release_frame(cam_pipeline_handle_t handle);
@@ -87,6 +97,22 @@ void cam_pipeline_pause_frame_access(cam_pipeline_handle_t handle);
  * Resume frame access after pause.
  */
 void cam_pipeline_resume_frame_access(cam_pipeline_handle_t handle);
+
+/* --- Display freeze (hold the current frame on screen) --- */
+
+/**
+ * Freeze the pipeline on the current frame: frame_cb stops promoting new
+ * camera frames and stops pushing to the display, so the last completed frame
+ * holds on screen. The front frame also stays stable, so a consumer can
+ * lock_frame() and copy it out for a WYSIWYG capture. The camera keeps
+ * running; frames are simply dropped while frozen.
+ */
+void cam_pipeline_freeze(cam_pipeline_handle_t handle);
+
+/**
+ * Resume normal streaming after freeze().
+ */
+void cam_pipeline_unfreeze(cam_pipeline_handle_t handle);
 
 /* --- Display overlay --- */
 

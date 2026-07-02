@@ -1,0 +1,14 @@
+menu "Camera Pipeline Entropy Consumer"
+
+    config CAM_PIPELINE_ENTROPY_TASK_STACK_SIZE
+        int "Entropy task stack size"
+        default 8192
+        help
+            Stack for the frame-hashing task. Hashing needs little stack; the
+            default leaves comfortable headroom for logging and mbedtls.
+
+    config CAM_PIPELINE_ENTROPY_TASK_PRIORITY
+        int "Entropy task priority"
+        default 5
+
+endmenu
