@@ -145,7 +145,12 @@ static void entropy_task(void *pvParameters) {
     if (e->task_done_sem) {
         xSemaphoreGive(e->task_done_sem);
     }
-    vTaskSuspend(NULL);
+
+    /* Self-delete rather than suspend-forever. The give above is this task's
+     * LAST touch of `e` (destroy frees `e` once it takes the sem), so
+     * vTaskDelete(NULL) releases only our own stack/TCB, which idle reclaims --
+     * the idiomatic worker exit. Same pattern as cam_pipeline_qr.c. */
+    vTaskDelete(NULL);
 }
 
 /* --- Public API --- */
@@ -286,10 +291,19 @@ void cam_pipeline_entropy_destroy(cam_pipeline_entropy_handle_t handle) {
     e->closing = true;
 
     if (e->task_handle && e->task_done_sem) {
-        if (xSemaphoreTake(e->task_done_sem, pdMS_TO_TICKS(500)) != pdTRUE) {
-            ESP_LOGW(TAG, "Timeout waiting for entropy task");
+        if (xSemaphoreTake(e->task_done_sem, pdMS_TO_TICKS(500)) == pdTRUE) {
+            /* Task signalled it is about to self-delete (vTaskDelete(NULL)); do
+             * NOT delete the handle here (that would be a double-delete, and a
+             * cross-core delete of a possibly-still-running task). Yield so idle
+             * can reclaim its stack before anything reuses it. */
+            vTaskDelay(pdMS_TO_TICKS(10));
+        } else {
+            /* No signal within 500 ms -> treat as hung and force-delete so the
+             * frees below can't run under a live task. Only fires on a real hang
+             * (the loop re-checks `closing` ~every 5-20 ms). */
+            ESP_LOGW(TAG, "Timeout waiting for entropy task; forcing delete");
+            vTaskDelete(e->task_handle);
         }
-        vTaskDelete(e->task_handle);
         e->task_handle = NULL;
     }
 
