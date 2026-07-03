@@ -352,7 +352,15 @@ static void qr_decode_task(void *pvParameters) {
     if (qr->task_done_sem) {
         xSemaphoreGive(qr->task_done_sem);
     }
-    vTaskSuspend(NULL);
+
+    /* Self-delete rather than suspend-forever. The give above is this task's
+     * LAST touch of `qr` -- destroy frees `qr` as soon as it takes the sem --
+     * so vTaskDelete(NULL) here releases only our own stack/TCB (separate from
+     * `qr`), which core-1 idle reclaims. This replaces the old pattern where
+     * destroy deleted us externally from core 0 while we might still be running
+     * on core 1; that deferred, non-synchronous reclamation leaked the 32 KB
+     * task stack on every start/stop cycle. */
+    vTaskDelete(NULL);
 }
 
 /* --- Public API --- */
@@ -464,11 +472,24 @@ void cam_pipeline_qr_destroy(cam_pipeline_qr_handle_t handle) {
     qr->closing = true;
 
     if (qr->task_handle && qr->task_done_sem) {
-        if (xSemaphoreTake(qr->task_done_sem, pdMS_TO_TICKS(500)) !=
-            pdTRUE) {
-            ESP_LOGW(TAG, "Timeout waiting for QR decode task");
+        if (xSemaphoreTake(qr->task_done_sem, pdMS_TO_TICKS(500)) == pdTRUE) {
+            /* Task signalled it is about to self-delete (vTaskDelete(NULL)).
+             * Do NOT delete the handle here: the task deletes itself, so an
+             * external delete would be a double-delete, and deleting it from
+             * this (caller's) core while it may still be finishing on core 1 is
+             * exactly what leaked the stack. Yield briefly so core-1 idle can
+             * reclaim the self-deleted stack/TCB before a later create()
+             * reallocates it; the app idles ~1-2 s here anyway -- this just
+             * makes a tight start/stop loop deterministic too. */
+            vTaskDelay(pdMS_TO_TICKS(10));
+        } else {
+            /* No signal within 500 ms -> treat the task as hung and force-delete
+             * as a last resort, so the free(qr) below cannot run under a live
+             * task (use-after-free). Only fires on a real hang, never in steady
+             * state (the decode loop re-checks `closing` ~every 5 ms). */
+            ESP_LOGW(TAG, "Timeout waiting for QR decode task; forcing delete");
+            vTaskDelete(qr->task_handle);
         }
-        vTaskDelete(qr->task_handle);
         qr->task_handle = NULL;
     }
 
