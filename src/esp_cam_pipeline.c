@@ -418,11 +418,19 @@ cam_pipeline_create(const cam_pipeline_config_t *config) {
             goto error;
         }
     }
-    // Initialize: front = buffer[0], back and locked start NULL
-    p->front_buffer = p->buffers[0];
+    // Initialize: NO frame is available yet. front_buffer stays NULL until frame_cb
+    // promotes the FIRST genuinely-captured frame, so a consumer (the QR decode task)
+    // can never lock a not-yet-written buffer. Priming front to buffers[0] used to hand
+    // the QR task an UNINITIALIZED buffer: on a camera reopen the same-size PSRAM
+    // re-allocation returns the previous session's address, still holding its last frame
+    // (e.g. a scanned SeedQR), so the decoder "instantly re-read" the prior QR before any
+    // live frame landed. The display path is unaffected -- it pushes the freshly-written
+    // `back` buffer, never front_buffer (which is why the stale frame never showed on the
+    // live preview).
+    p->front_buffer = NULL;
     p->back_buffer = NULL;
     p->locked_buffer = NULL;
-    p->front_consumed = true;   // don't skip the very first frame
+    p->front_consumed = true;   // moot until front_buffer is set (skip check needs it non-NULL)
     p->skip_count = 0;
 
     p->buffer_mutex = xSemaphoreCreateMutex();
