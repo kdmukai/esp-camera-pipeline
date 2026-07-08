@@ -424,7 +424,11 @@ cam_pipeline_qr_create(const cam_pipeline_qr_config_t *config) {
         CONFIG_CAM_PIPELINE_QR_TASK_PRIORITY,
         &qr->task_handle, 1);
     if (result != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create QR decode task");
+        ESP_LOGE(TAG, "Failed to create QR decode task "
+                 "(INTERNAL free=%u largest=%u, wanted %d stack)",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                 (int)CONFIG_CAM_PIPELINE_QR_TASK_STACK_SIZE);
         goto error;
     }
 
