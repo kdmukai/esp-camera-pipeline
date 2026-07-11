@@ -353,14 +353,17 @@ static void qr_decode_task(void *pvParameters) {
         xSemaphoreGive(qr->task_done_sem);
     }
 
-    /* Self-delete rather than suspend-forever. The give above is this task's
-     * LAST touch of `qr` -- destroy frees `qr` as soon as it takes the sem --
-     * so vTaskDelete(NULL) here releases only our own stack/TCB (separate from
-     * `qr`), which core-1 idle reclaims. This replaces the old pattern where
-     * destroy deleted us externally from core 0 while we might still be running
-     * on core 1; that deferred, non-synchronous reclamation leaked the 32 KB
-     * task stack on every start/stop cycle. */
-    vTaskDelete(NULL);
+    /* Park -- do NOT self-delete. The stack/TCB came from
+     * xTaskCreatePinnedToCoreWithCaps(), and a self vTaskDelete(NULL) would
+     * leak them: the idle task never frees WithCaps memory. The give above is
+     * this task's LAST touch of `qr` (and its last use of the frame -- released
+     * at the bottom of the loop), so it is safe to reclaim us now. destroy()
+     * takes the sem (orderly-shutdown handshake: it knows the frame is
+     * released) then calls vTaskDeleteWithCaps(), which suspends us, waits until
+     * we are off-core (cross-core-safe -- the exact guarantee the old
+     * self-delete design was built to get), then deletes us and frees the
+     * internal TCB + the PSRAM stack. */
+    vTaskSuspend(NULL);
 }
 
 /* --- Public API --- */
@@ -417,18 +420,33 @@ cam_pipeline_qr_create(const cam_pipeline_qr_config_t *config) {
     qr->last_log_time = esp_timer_get_time();
 #endif
 
-    // Pin decode task to Core 1 to avoid competing with camera on Core 0
-    BaseType_t result = xTaskCreatePinnedToCore(
+    // Pin decode task to Core 1 to avoid competing with camera on Core 0.
+    //
+    // The stack is allocated in PSRAM (WithCaps puts only the stack under the
+    // given caps; the TCB stays in internal RAM). The decode task is pure quirc
+    // CPU over PSRAM-resident data and never runs while the flash cache is
+    // disabled, so a PSRAM stack is safe. This removes the 16 KB *contiguous
+    // internal* requirement that could not be met on SPI-display boards (ST7796,
+    // e.g. P4 LCD 3.5): there the internal heap is squeezed by the internal-DMA
+    // LVGL draw + camera stripe buffers that MIPI-DSI boards keep in PSRAM, so
+    // re-opening the camera for a 2nd session (scan a SeedQR after a PSBT scan)
+    // failed here even with plenty of free internal RAM (observed free=47 KB but
+    // largest block=13 KB -- fragmentation, not exhaustion) and wedged the app.
+    // Reclaimed via vTaskDeleteWithCaps() in cam_pipeline_qr_destroy().
+    BaseType_t result = xTaskCreatePinnedToCoreWithCaps(
         qr_decode_task, "qr_decode",
         CONFIG_CAM_PIPELINE_QR_TASK_STACK_SIZE, qr,
         CONFIG_CAM_PIPELINE_QR_TASK_PRIORITY,
-        &qr->task_handle, 1);
+        &qr->task_handle, 1,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (result != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create QR decode task "
-                 "(INTERNAL free=%u largest=%u, wanted %d stack)",
+        ESP_LOGE(TAG, "Failed to create QR decode task (wanted %d stack; "
+                 "SPIRAM free=%u largest=%u; INTERNAL free=%u largest=%u)",
+                 (int)CONFIG_CAM_PIPELINE_QR_TASK_STACK_SIZE,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-                 (int)CONFIG_CAM_PIPELINE_QR_TASK_STACK_SIZE);
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         goto error;
     }
 
@@ -476,24 +494,23 @@ void cam_pipeline_qr_destroy(cam_pipeline_qr_handle_t handle) {
     qr->closing = true;
 
     if (qr->task_handle && qr->task_done_sem) {
-        if (xSemaphoreTake(qr->task_done_sem, pdMS_TO_TICKS(500)) == pdTRUE) {
-            /* Task signalled it is about to self-delete (vTaskDelete(NULL)).
-             * Do NOT delete the handle here: the task deletes itself, so an
-             * external delete would be a double-delete, and deleting it from
-             * this (caller's) core while it may still be finishing on core 1 is
-             * exactly what leaked the stack. Yield briefly so core-1 idle can
-             * reclaim the self-deleted stack/TCB before a later create()
-             * reallocates it; the app idles ~1-2 s here anyway -- this just
-             * makes a tight start/stop loop deterministic too. */
-            vTaskDelay(pdMS_TO_TICKS(10));
-        } else {
-            /* No signal within 500 ms -> treat the task as hung and force-delete
-             * as a last resort, so the free(qr) below cannot run under a live
-             * task (use-after-free). Only fires on a real hang, never in steady
-             * state (the decode loop re-checks `closing` ~every 5 ms). */
+        /* Orderly-shutdown handshake: the task gives this sem once it has
+         * released its last frame and is about to park (vTaskSuspend(NULL)).
+         * Waiting on it here guarantees we delete the task at a safe point (no
+         * frame ref held), not mid-decode. */
+        if (xSemaphoreTake(qr->task_done_sem, pdMS_TO_TICKS(500)) != pdTRUE) {
+            /* No signal within 500 ms -> the task is hung mid-decode. Delete it
+             * anyway; vTaskDeleteWithCaps() suspends it before freeing, so this
+             * is safe even against a live task (a frame ref may leak, as with
+             * the old force-delete, but that only fires on a real hang -- the
+             * decode loop re-checks `closing` ~every 5 ms). */
             ESP_LOGW(TAG, "Timeout waiting for QR decode task; forcing delete");
-            vTaskDelete(qr->task_handle);
         }
+        /* Reclaim the task. vTaskDeleteWithCaps() suspends it, spins until it is
+         * no longer running (cross-core-safe), then frees the internal TCB and
+         * the PSRAM stack allocated by xTaskCreatePinnedToCoreWithCaps(). It is
+         * synchronous, so no post-delete yield is needed before free(qr) below. */
+        vTaskDeleteWithCaps(qr->task_handle);
         qr->task_handle = NULL;
     }
 
