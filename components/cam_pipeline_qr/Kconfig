@@ -2,7 +2,10 @@ menu "Camera Pipeline QR Consumer"
 
     config CAM_PIPELINE_QR_TASK_STACK_SIZE
         int "QR decode task stack size"
-        default 32768
+        # Measured high-water is ~8 KB (uxTaskGetStackHighWaterMark across dense BBQr/PSBT
+        # scans); 16 KB is 2x that. Right-sized down from 32 KB so this internal-only task
+        # stack fits a fragmented internal heap (see camera-qr-task-internal-ram-starvation).
+        default 16384
 
     config CAM_PIPELINE_QR_TASK_PRIORITY
         int "QR decode task priority"

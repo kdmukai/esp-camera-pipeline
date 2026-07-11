@@ -146,11 +146,13 @@ static void entropy_task(void *pvParameters) {
         xSemaphoreGive(e->task_done_sem);
     }
 
-    /* Self-delete rather than suspend-forever. The give above is this task's
-     * LAST touch of `e` (destroy frees `e` once it takes the sem), so
-     * vTaskDelete(NULL) releases only our own stack/TCB, which idle reclaims --
-     * the idiomatic worker exit. Same pattern as cam_pipeline_qr.c. */
-    vTaskDelete(NULL);
+    /* Park -- do NOT self-delete. The stack/TCB came from
+     * xTaskCreatePinnedToCoreWithCaps(), so a self vTaskDelete(NULL) would leak
+     * them (idle never frees WithCaps memory). The give above is this task's
+     * LAST touch of `e`, so destroy() -- after taking the sem -- reclaims us via
+     * vTaskDeleteWithCaps() (suspends us, waits until off-core, frees TCB +
+     * PSRAM stack). Same pattern as cam_pipeline_qr.c. */
+    vTaskSuspend(NULL);
 }
 
 /* --- Public API --- */
@@ -209,13 +211,26 @@ cam_pipeline_entropy_create(const cam_pipeline_entropy_config_t *config) {
         goto error;
     }
 
-    /* Pin to Core 1 to avoid competing with the camera on Core 0 */
-    BaseType_t result = xTaskCreatePinnedToCore(
+    /* Pin to Core 1 to avoid competing with the camera on Core 0. Stack in
+     * PSRAM (WithCaps keeps the TCB internal): the entropy task is pure CPU over
+     * PSRAM-resident frames and never runs with the flash cache disabled, so a
+     * PSRAM stack is safe -- and it removes the contiguous-internal requirement
+     * that the SPI-display boards' squeezed internal heap may not satisfy (same
+     * fix + rationale as cam_pipeline_qr.c). Reclaimed via vTaskDeleteWithCaps()
+     * in cam_pipeline_entropy_destroy(). */
+    BaseType_t result = xTaskCreatePinnedToCoreWithCaps(
         entropy_task, "cam_entropy",
         CONFIG_CAM_PIPELINE_ENTROPY_TASK_STACK_SIZE, e,
-        CONFIG_CAM_PIPELINE_ENTROPY_TASK_PRIORITY, &e->task_handle, 1);
+        CONFIG_CAM_PIPELINE_ENTROPY_TASK_PRIORITY, &e->task_handle, 1,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (result != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create entropy task");
+        ESP_LOGE(TAG, "Failed to create entropy task (wanted %d stack; "
+                 "SPIRAM free=%u largest=%u; INTERNAL free=%u largest=%u)",
+                 (int)CONFIG_CAM_PIPELINE_ENTROPY_TASK_STACK_SIZE,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         goto error;
     }
 
@@ -291,19 +306,19 @@ void cam_pipeline_entropy_destroy(cam_pipeline_entropy_handle_t handle) {
     e->closing = true;
 
     if (e->task_handle && e->task_done_sem) {
-        if (xSemaphoreTake(e->task_done_sem, pdMS_TO_TICKS(500)) == pdTRUE) {
-            /* Task signalled it is about to self-delete (vTaskDelete(NULL)); do
-             * NOT delete the handle here (that would be a double-delete, and a
-             * cross-core delete of a possibly-still-running task). Yield so idle
-             * can reclaim its stack before anything reuses it. */
-            vTaskDelay(pdMS_TO_TICKS(10));
-        } else {
-            /* No signal within 500 ms -> treat as hung and force-delete so the
-             * frees below can't run under a live task. Only fires on a real hang
-             * (the loop re-checks `closing` ~every 5-20 ms). */
+        /* Wait for the task to release its resources and park (it gives the sem
+         * then vTaskSuspend(NULL)s), so we delete it at a safe point. */
+        if (xSemaphoreTake(e->task_done_sem, pdMS_TO_TICKS(500)) != pdTRUE) {
+            /* No signal within 500 ms -> the task is hung. vTaskDeleteWithCaps()
+             * suspends it before freeing, so deleting it is safe even against a
+             * live task (only fires on a real hang -- the loop re-checks
+             * `closing` ~every 5-20 ms). */
             ESP_LOGW(TAG, "Timeout waiting for entropy task; forcing delete");
-            vTaskDelete(e->task_handle);
         }
+        /* Reclaim the WithCaps task: suspend, wait until off-core (cross-core
+         * safe), delete, free the internal TCB + PSRAM stack. Synchronous, so no
+         * post-delete yield is needed. */
+        vTaskDeleteWithCaps(e->task_handle);
         e->task_handle = NULL;
     }
 
