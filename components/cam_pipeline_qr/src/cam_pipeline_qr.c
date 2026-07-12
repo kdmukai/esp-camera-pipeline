@@ -293,7 +293,11 @@ static void qr_decode_task(void *pvParameters) {
                     float px_per_mod = modules ? side_px / modules : 0.0f;
                     qr->last_px_per_module = px_per_mod;
                     qr->last_modules = (uint16_t)modules;
-                    ESP_LOGI(TAG,
+                    /* Per-decode detail at DEBUG so QR_DEBUG's INFO stream stays
+                     * the clean 2s summary (`decode=..`) + the coordinator's
+                     * `scan:` rate line, not one line per frame. Raise the tag to
+                     * DEBUG (or esp_log_level_set) to recover the px/module sweep. */
+                    ESP_LOGD(TAG,
                              "QRPX v%d mod%d side%.0fpx %.2fpx/mod len%d %.24s",
                              qr_result.data.version, modules, side_px,
                              px_per_mod, qr_result.data.payload_len,
@@ -315,7 +319,9 @@ static void qr_decode_task(void *pvParameters) {
                      * succeeds but decode fails (e.g. blown-out highlights up
                      * close). Module count is unknown — decode failed. */
                     __atomic_add_fetch(&qr->missed_codes, 1, __ATOMIC_RELAXED);
-                    ESP_LOGI(TAG, "QRMISS side%.0fpx err=%d(%s)",
+                    /* Per-miss detail at DEBUG (see QRPX note); the miss *rate*
+                     * lives in the `scan:` line + `decode=..` id%/ok% summary. */
+                    ESP_LOGD(TAG, "QRMISS side%.0fpx err=%d(%s)",
                              side_px, err, k_quirc_strerror(err));
                 }
 #endif
