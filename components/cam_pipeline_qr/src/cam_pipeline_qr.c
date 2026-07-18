@@ -291,7 +291,7 @@ struct cam_pipeline_qr {
     /* Adaptive-decode (sweep+lock) cost/behaviour, per window. */
     volatile uint32_t adaptive_passes;   /* sum of identify passes over frames */
     volatile uint32_t adaptive_frames;   /* frames run through decode_adaptive */
-    volatile uint32_t adaptive_local;    /* frames where the local pass fired */
+    volatile uint32_t adaptive_bailed;   /* frames the blend gate bailed early */
     volatile int32_t  last_locked_offset;/* most recent locked threshold offset */
     int64_t last_log_time;
     cam_pipeline_qr_debug_stats_t last_stats; /* latest snapshot for getter */
@@ -484,20 +484,21 @@ static void log_debug_metrics(struct cam_pipeline_qr *qr) {
     }
 
     /* Adaptive-decode phase monitor: passes/frame is the cost driver
-     * (~1 once locked, up to the FAST cap on acquisition/misses); local% is how
-     * often the THOROUGH second pass fired; lock is the current offset. */
+     * (~1 once locked, up to the FAST cap on acquisition/misses); bail% is how
+     * often the blend gate cut the sweep short on animation-torn frames; lock is
+     * the current offset. */
     float avg_passes = 0;
-    float local_pct = 0;
+    float bail_pct = 0;
     if (qr->adaptive_frames > 0) {
         avg_passes = (float)qr->adaptive_passes / qr->adaptive_frames;
-        local_pct = 100.0f * qr->adaptive_local / qr->adaptive_frames;
+        bail_pct = 100.0f * qr->adaptive_bailed / qr->adaptive_frames;
     }
 
     ESP_LOGI(TAG,
              "decode=%.1ffps(gray=%.1fms quirc=%.1fms) det/s=%.1f "
-             "id=%.0f%% ok=%.0f%% | sweep=%.2fpass/f local=%.0f%% lock=%+d",
+             "id=%.0f%% ok=%.0f%% | sweep=%.2fpass/f bail=%.0f%% lock=%+d",
              consumer_fps, avg_gray_ms, avg_quirc_ms, detections_per_sec,
-             identify_pct, decode_pct, avg_passes, local_pct,
+             identify_pct, decode_pct, avg_passes, bail_pct,
              (int)qr->last_locked_offset);
 
 #ifdef CAM_PIPELINE_QR_CPU_PROBE
@@ -538,7 +539,7 @@ static void log_debug_metrics(struct cam_pipeline_qr *qr) {
     qr->frames_decoded = 0;
     qr->adaptive_passes = 0;
     qr->adaptive_frames = 0;
-    qr->adaptive_local = 0;
+    qr->adaptive_bailed = 0;
     qr->last_log_time = now;
 }
 #endif
@@ -861,7 +862,7 @@ static void qr_decode_task(void *pvParameters) {
                          "QRPX v%d mod%d side%.0fpx %.2fpx/mod len%d pass%d off%+d %.24s",
                          qr_result.data.version, modules, side_px, px_per_mod,
                          qr_result.data.payload_len, astats.passes,
-                         astats.win_offset, (const char *)qr_result.data.payload);
+                         astats.locked_offset, (const char *)qr_result.data.payload);
             } else if (any_identified) {
                 /* Located but swept-and-failed: the whole offset ladder (+ the
                  * local pass under THOROUGH) could not resolve the modules. */
@@ -869,16 +870,16 @@ static void qr_decode_task(void *pvParameters) {
                 frame_has_miss = true;
                 frame_miss_err = (int)K_QUIRC_ERROR_DATA_ECC;
                 frame_miss_side = side_px;
-                ESP_LOGD(TAG, "QRMISS side%.0fpx pass%d lock%+d local%d",
+                ESP_LOGD(TAG, "QRMISS side%.0fpx pass%d lock%+d blend%d bail%d",
                          side_px, astats.passes, astats.locked_offset,
-                         (int)astats.used_local);
+                         astats.blend_score, (int)astats.bailed_blend);
             }
             /* Adaptive-decode cost/behaviour readout (phase monitor). */
             __atomic_add_fetch(&qr->adaptive_passes, (uint32_t)astats.passes,
                                __ATOMIC_RELAXED);
             __atomic_add_fetch(&qr->adaptive_frames, 1, __ATOMIC_RELAXED);
-            if (astats.used_local) {
-                __atomic_add_fetch(&qr->adaptive_local, 1, __ATOMIC_RELAXED);
+            if (astats.bailed_blend) {
+                __atomic_add_fetch(&qr->adaptive_bailed, 1, __ATOMIC_RELAXED);
             }
             qr->last_locked_offset = astats.locked_offset;
 #endif
