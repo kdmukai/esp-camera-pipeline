@@ -115,6 +115,66 @@ static void log_debug_metrics(struct cam_pipeline *p) {
 }
 #endif
 
+#if SOC_PPA_SUPPORTED
+/*
+ * Second PPA pass: crop the central SQUARE of the raw sensor frame and
+ * scale+rotate it into the dedicated still buffer at still_w x still_h. Same
+ * fill-cover math as the display pass, but the target is a square, so the height
+ * binds (the sensor is landscape) and the excess width is centre-cropped —
+ * yielding the sensor's square field of view at the configured resolution, in the
+ * same orientation as the on-screen preview. For a still equal to the sensor
+ * height this is a pure 1:1 centre-crop (scale 1.0); a smaller still scales it
+ * down. Runs once per request_still(), from frame_cb, on the same camera_buf the
+ * display just used (so the still matches what the user is looking at).
+ */
+static void grab_still(struct cam_pipeline *p, const uint8_t *camera_buf,
+                       uint32_t camera_width, uint32_t camera_height) {
+    uint32_t sw = p->still_w;
+    uint32_t sh = p->still_h;
+
+    /* Fill-cover: the larger of the two ratios covers the square target and
+     * crops the overflow off the long (width) axis. Quantize UP to a PPA-
+     * representable 4-bit fractional scale so the output is >= the target, then
+     * clip to exactly still_w x still_h. */
+    float scx = (float)sw / camera_width;
+    float scy = (float)sh / camera_height;
+    float scale = (scx > scy) ? scx : scy;
+    float q_scale = ceilf(scale * 16.0f) / 16.0f;
+
+    uint32_t in_w = (uint32_t)ceilf((float)sw / q_scale);
+    uint32_t in_h = (uint32_t)ceilf((float)sh / q_scale);
+    if (in_w > camera_width)  in_w = camera_width;
+    if (in_h > camera_height) in_h = camera_height;
+    uint32_t off_x = (camera_width - in_w) / 2;
+    uint32_t off_y = (camera_height - in_h) / 2;
+
+    ppa_srm_oper_config_t srm = {
+        .in.buffer = camera_buf,
+        .in.pic_w = camera_width,
+        .in.pic_h = camera_height,
+        .in.block_w = in_w,
+        .in.block_h = in_h,
+        .in.block_offset_x = off_x,
+        .in.block_offset_y = off_y,
+        .in.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+        .out.buffer = p->still_buffer,
+        .out.buffer_size = p->still_buffer_size,
+        .out.pic_w = sw,
+        .out.pic_h = sh,
+        .out.block_offset_x = 0,
+        .out.block_offset_y = 0,
+        .out.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+        .rotation_angle = p->ppa_angle,
+        .scale_x = q_scale,
+        .scale_y = q_scale,
+        .mode = PPA_TRANS_MODE_BLOCKING,
+    };
+    if (ppa_do_scale_rotate_mirror(p->ppa_client, &srm) == ESP_OK) {
+        p->still_ready = true;
+    }
+}
+#endif
+
 /*
  * Camera frame callback — called by the camera driver for each captured frame.
  * Runs on the camera driver's core (typically Core 0).
@@ -336,6 +396,17 @@ static void frame_cb(uint8_t *camera_buf, uint32_t camera_width,
     p->frame_generation++;  // new front frame available to consumers
     xSemaphoreGive(p->buffer_mutex);
 
+#if SOC_PPA_SUPPORTED
+    /* High-resolution still: grab it from the SAME camera_buf the display just
+     * used, so the still matches the on-screen frame. One-shot — only while a
+     * consumer has armed a grab that has not yet completed. camera_buf is still
+     * valid here (frame_cb has not returned to the driver). */
+    if (p->still_request && !p->still_ready && p->still_buffer && p->ppa_client &&
+        !p->closing) {
+        grab_still(p, camera_buf, camera_width, camera_height);
+    }
+#endif
+
     __atomic_sub_fetch(&p->active_frame_operations, 1, __ATOMIC_SEQ_CST);
 }
 
@@ -406,6 +477,8 @@ cam_pipeline_create(const cam_pipeline_config_t *config) {
 
     p->display_width = config->display_width;
     p->display_height = config->display_height;
+    p->still_w = config->still_width;
+    p->still_h = config->still_height;
     p->camera_driver = config->camera_driver;
     p->display_driver = config->display_driver;
 
@@ -432,6 +505,23 @@ cam_pipeline_create(const cam_pipeline_config_t *config) {
     p->locked_buffer = NULL;
     p->front_consumed = true;   // moot until front_buffer is set (skip check needs it non-NULL)
     p->skip_count = 0;
+
+#if SOC_PPA_SUPPORTED
+    /* Optional high-resolution still buffer (see cam_pipeline_request_still). A
+     * soft failure: if it can't allocate, the pipeline still runs and
+     * cam_pipeline_still_supported() reports false, so consumers fall back to a
+     * display-resolution latch. */
+    if (p->still_w > 0 && p->still_h > 0) {
+        p->still_buffer_size = (size_t)p->still_w * p->still_h * 2;
+        p->still_buffer = allocate_buffer(p->still_buffer_size);
+        if (!p->still_buffer) {
+            ESP_LOGW(TAG,
+                     "Still buffer alloc failed (%u B) — high-res still disabled",
+                     (unsigned)p->still_buffer_size);
+            p->still_buffer_size = 0;
+        }
+    }
+#endif
 
     p->buffer_mutex = xSemaphoreCreateMutex();
     if (!p->buffer_mutex) {
@@ -559,6 +649,21 @@ void cam_pipeline_destroy(cam_pipeline_handle_t handle) {
     p->back_buffer = NULL;
     p->locked_buffer = NULL;
 
+    // Free the high-resolution still buffer. Scrub it first: it holds the last
+    // captured still, which for the entropy consumer is seed material — same
+    // hygiene as the entropy latch. The heap_caps_free() below is an opaque call
+    // the compiler can't see through, so it cannot prove the memset dead and drop
+    // it (the entropy latch itself is scrubbed with mbedtls_platform_zeroize in
+    // cam_pipeline_entropy_destroy).
+    if (p->still_buffer) {
+        memset(p->still_buffer, 0, p->still_buffer_size);
+        heap_caps_free(p->still_buffer);
+        p->still_buffer = NULL;
+        p->still_buffer_size = 0;
+    }
+    p->still_ready = false;
+    p->still_request = false;
+
     // Free PPA resources
 #if SOC_PPA_SUPPORTED
     if (p->ppa_client) {
@@ -641,6 +746,32 @@ void cam_pipeline_unfreeze(cam_pipeline_handle_t handle) {
     if (handle) {
         handle->frozen = false;
     }
+}
+
+/* --- High-resolution still grab --- */
+
+bool cam_pipeline_still_supported(cam_pipeline_handle_t handle) {
+    return handle && handle->still_buffer != NULL;
+}
+
+void cam_pipeline_request_still(cam_pipeline_handle_t handle) {
+    if (!handle || !handle->still_buffer) {
+        return;
+    }
+    /* Clear ready BEFORE arming so a stale still from a prior capture is never
+     * returned, and frame_cb's (request && !ready) guard fires for the fresh
+     * grab. The ordering matters: a frame_cb racing here either sees the old
+     * ready==true (skips, harmless — we clear it next) or the new request==true
+     * with ready==false (grabs). */
+    handle->still_ready = false;
+    handle->still_request = true;
+}
+
+const uint8_t *cam_pipeline_lock_still(cam_pipeline_handle_t handle) {
+    if (!handle || !handle->still_buffer || !handle->still_ready) {
+        return NULL;
+    }
+    return handle->still_buffer;
 }
 
 /* --- Display overlay --- */

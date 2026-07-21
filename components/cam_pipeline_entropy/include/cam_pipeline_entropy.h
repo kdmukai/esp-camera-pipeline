@@ -40,8 +40,15 @@ typedef void (*cam_pipeline_entropy_frame_cb_t)(uint32_t frames_chained,
 
 typedef struct {
     cam_pipeline_handle_t pipeline; // pipeline to consume frames from
-    uint32_t frame_width;           // frame dimensions (for latch sizing)
+    uint32_t frame_width;           // PREVIEW frame dimensions (what gets chained)
     uint32_t frame_height;
+    // OPTIONAL high-resolution still dimensions (P4 only). When non-zero AND the
+    // pipeline supports a still grab (cam_pipeline_still_supported), capture()
+    // latches a still at these dims via a second PPA pass instead of the preview
+    // frame; get_result()'s `frame` is then the full-resolution still. Leave 0 to
+    // latch the preview frame (S3 / no PPA). The still is a SQUARE.
+    uint32_t still_width;
+    uint32_t still_height;
     const uint8_t *seed_hash;       // OPTIONAL 32-byte chain seed; NULL = none
     cam_pipeline_entropy_frame_cb_t on_frame; // OPTIONAL progress callback
     void *user_ctx;                 // passed to on_frame
@@ -63,10 +70,15 @@ cam_pipeline_entropy_create(const cam_pipeline_entropy_config_t *config);
 void cam_pipeline_entropy_destroy(cam_pipeline_entropy_handle_t handle);
 
 /**
- * Arm capture. On its next iteration the consumer task freezes the pipeline
- * display (holding the current frame on screen), latches that exact frame as
- * the final image, and freezes the chain digest at its pre-final value (the
- * latched frame is NOT chained). Idempotent while already captured.
+ * Arm capture. On its next iteration the consumer task latches the final image
+ * and freezes the chain digest at its pre-final value (the latched frame is NOT
+ * chained). Idempotent while already captured.
+ *
+ * When high-resolution still dims were configured and the pipeline supports them,
+ * the latch is a SECOND-PPA-pass still grabbed BEFORE the freeze (frame_cb skips a
+ * frozen frame, so the still must be taken while streaming), then the display
+ * freezes. Otherwise it freezes first and latches the display-resolution frame,
+ * matching what is on screen (WYSIWYG).
  */
 void cam_pipeline_entropy_capture(cam_pipeline_entropy_handle_t handle);
 
@@ -75,8 +87,10 @@ void cam_pipeline_entropy_capture(cam_pipeline_entropy_handle_t handle);
  *   chain          -> 32-byte chained digest over seed + all preview frames
  *                     (EXCLUDING the latched final image)
  *   chain_len      -> 32
- *   frame          -> latched RGB565 final-image bytes
- *   frame_len      -> frame_width * frame_height * 2
+ *   frame          -> latched RGB565 final-image bytes (the high-resolution still
+ *                     when configured, else the display-resolution frame)
+ *   frame_len      -> bytes actually latched (still_w*still_h*2, or the preview
+ *                     frame_width*frame_height*2 when no still was grabbed)
  *   frames_chained -> number of preview frames mixed into the chain
  * The chain and frame pointers stay valid until resume() or destroy(). Any
  * out-parameter may be NULL. Returns false until the latch completes after
