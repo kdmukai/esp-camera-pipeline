@@ -27,7 +27,13 @@ struct cam_pipeline_entropy {
     cam_pipeline_handle_t pipeline;
     uint32_t frame_width;
     uint32_t frame_height;
-    size_t frame_len; /* frame_width * frame_height * 2 (RGB565) */
+    size_t frame_len; /* PREVIEW frame bytes: frame_width*frame_height*2 (chained) */
+
+    /* High-resolution still (P4). still_len is the latched-image size when the
+     * pipeline can grab a still; has_still gates the capture path. */
+    size_t still_len; /* still_width*still_height*2, or 0 if no still */
+    bool has_still;
+
     cam_pipeline_entropy_frame_cb_t on_frame;
     void *user_ctx;
 
@@ -37,8 +43,13 @@ struct cam_pipeline_entropy {
     uint32_t frames_chained;
     uint32_t last_gen; /* last pipeline frame generation hashed (skip dups) */
 
-    /* Latched final image (PSRAM), copied once at capture */
+    /* Latched final image (PSRAM), copied once at capture. Allocated at latch_cap
+     * (the still size when a still can be grabbed, else the preview size);
+     * result_len is how many bytes the latch actually holds after capture (still
+     * or preview) and is what get_result() reports. */
     uint8_t *latch;
+    size_t latch_cap;
+    size_t result_len;
 
     /* Shared flags/counters guarded by state_mutex */
     SemaphoreHandle_t state_mutex;
@@ -83,30 +94,62 @@ static void entropy_task(void *pvParameters) {
         (struct cam_pipeline_entropy *)pvParameters;
 
     while (!e->closing) {
-        /* Capture takes priority: freeze first so the front frame == what is
-         * on screen, then lock + copy that exact frame. */
+        /* Capture takes priority. Two paths:
+         *  - High-res still (P4/PPA): arm the grab, poll until frame_cb fills the
+         *    still buffer (from a live frame -- a frozen frame is skipped), THEN
+         *    freeze the display and copy the still out. ~1 frame of skew from the
+         *    preview, negligible for an entropy still.
+         *  - Fallback (S3 / no still): freeze first so the front frame == what is
+         *    on screen, then lock + copy that exact display-resolution frame. */
         if (e->arm_capture && !e->captured) {
-            cam_pipeline_freeze(e->pipeline);
-            /* Let any in-flight frame_cb finish promoting/pushing so the front
-             * buffer and the displayed frame agree (WYSIWYG). */
-            vTaskDelay(pdMS_TO_TICKS(2));
+            size_t copied = 0;
 
-            const uint8_t *frame = cam_pipeline_lock_frame(e->pipeline);
-            if (frame) {
+            if (e->has_still) {
+                cam_pipeline_request_still(e->pipeline);
+                const uint8_t *still = NULL;
+                /* Poll ~300 ms (many frames at any capture rate). The grab is a
+                 * blocking PPA op inside frame_cb, so it lands within a frame or
+                 * two unless the camera has stalled. */
+                for (int i = 0; i < 60 && !e->closing; i++) {
+                    still = cam_pipeline_lock_still(e->pipeline);
+                    if (still) {
+                        break;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                }
+                if (!still) {
+                    /* Grab didn't complete -- retry the whole capture (re-arms). */
+                    continue;
+                }
+                cam_pipeline_freeze(e->pipeline);
+                memcpy(e->latch, still, e->still_len);
+                copied = e->still_len;
+            } else {
+                cam_pipeline_freeze(e->pipeline);
+                /* Let any in-flight frame_cb finish promoting/pushing so the front
+                 * buffer and the displayed frame agree (WYSIWYG). */
+                vTaskDelay(pdMS_TO_TICKS(2));
+
+                const uint8_t *frame = cam_pipeline_lock_frame(e->pipeline);
+                if (!frame) {
+                    /* Front not ready yet -- retry next iteration */
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                    continue;
+                }
                 memcpy(e->latch, frame, e->frame_len);
                 cam_pipeline_release_frame(e->pipeline);
-
-                xSemaphoreTake(e->state_mutex, portMAX_DELAY);
-                e->captured = true;
-                e->arm_capture = false;
-                uint32_t n = e->frames_chained;
-                xSemaphoreGive(e->state_mutex);
-
-                ESP_LOGI(TAG, "captured after %" PRIu32 " chained frames", n);
-            } else {
-                /* Front not ready yet -- retry next iteration */
-                vTaskDelay(pdMS_TO_TICKS(5));
+                copied = e->frame_len;
             }
+
+            xSemaphoreTake(e->state_mutex, portMAX_DELAY);
+            e->result_len = copied;
+            e->captured = true;
+            e->arm_capture = false;
+            uint32_t n = e->frames_chained;
+            xSemaphoreGive(e->state_mutex);
+
+            ESP_LOGI(TAG, "captured %u-byte %s after %" PRIu32 " chained frames",
+                     (unsigned)copied, e->has_still ? "still" : "frame", n);
             continue;
         }
 
@@ -182,20 +225,34 @@ cam_pipeline_entropy_create(const cam_pipeline_entropy_config_t *config) {
     e->on_frame = config->on_frame;
     e->user_ctx = config->user_ctx;
 
+    /* Use a high-resolution still only if BOTH the caller asked for one AND the
+     * pipeline can actually grab it (PPA present, still buffer allocated). This
+     * keeps the S3 / no-PPA / OOM paths on the display-resolution latch and never
+     * polls for a still that will never arrive. */
+    if (config->still_width > 0 && config->still_height > 0 &&
+        cam_pipeline_still_supported(config->pipeline)) {
+        e->still_len = (size_t)config->still_width * config->still_height * 2;
+        e->has_still = true;
+    }
+
+    /* The latch must hold whichever image capture() copies: the still when we can
+     * grab one, else the preview frame. */
+    e->latch_cap = e->has_still ? e->still_len : e->frame_len;
+
     if (config->seed_hash) {
         memcpy(e->chain, config->seed_hash, ENTROPY_DIGEST_LEN);
         e->has_chain = true;
     }
 
     e->latch =
-        heap_caps_malloc(e->frame_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        heap_caps_malloc(e->latch_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!e->latch) {
-        e->latch = heap_caps_malloc(e->frame_len,
+        e->latch = heap_caps_malloc(e->latch_cap,
                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     }
     if (!e->latch) {
         ESP_LOGE(TAG, "Failed to allocate %u-byte latch buffer",
-                 (unsigned)e->frame_len);
+                 (unsigned)e->latch_cap);
         goto error;
     }
 
@@ -235,9 +292,10 @@ cam_pipeline_entropy_create(const cam_pipeline_entropy_config_t *config) {
     }
 
     ESP_LOGI(TAG,
-             "Entropy consumer created: %" PRIu32 "x%" PRIu32
-             " (%u-byte frames, seed=%s)",
+             "Entropy consumer created: preview %" PRIu32 "x%" PRIu32
+             " (%u-byte frames), still=%s (%u-byte latch), seed=%s",
              e->frame_width, e->frame_height, (unsigned)e->frame_len,
+             e->has_still ? "yes" : "no", (unsigned)e->latch_cap,
              config->seed_hash ? "yes" : "no");
 
     return e;
@@ -275,7 +333,7 @@ bool cam_pipeline_entropy_get_result(cam_pipeline_entropy_handle_t handle,
             *frame = handle->latch;
         }
         if (frame_len) {
-            *frame_len = handle->frame_len;
+            *frame_len = handle->result_len;
         }
         if (frames_chained) {
             *frames_chained = handle->frames_chained;
@@ -339,7 +397,7 @@ void cam_pipeline_entropy_destroy(cam_pipeline_entropy_handle_t handle) {
     /* Zeroize sensitive material before freeing (chain feeds a private key) */
     mbedtls_platform_zeroize(e->chain, sizeof(e->chain));
     if (e->latch) {
-        mbedtls_platform_zeroize(e->latch, e->frame_len);
+        mbedtls_platform_zeroize(e->latch, e->latch_cap);
         heap_caps_free(e->latch);
         e->latch = NULL;
     }

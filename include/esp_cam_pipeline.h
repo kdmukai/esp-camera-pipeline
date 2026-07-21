@@ -22,6 +22,15 @@ typedef struct {
     uint32_t display_height; // Cropped frame height for display + consumers
     uint32_t rotation;       // PPA rotation in degrees: 0, 90, 180, 270 (P4 only)
 
+    // Optional high-resolution still (P4 only). When non-zero AND the SoC has a
+    // PPA, the pipeline allocates a dedicated still buffer and, on request_still(),
+    // runs a SECOND PPA pass over the raw sensor frame into it (see request_still).
+    // Meant to be a SQUARE (still_width == still_height) at a higher resolution than
+    // the display crop, for a legible entropy confirm image. Leave 0 to disable
+    // (the consumer then latches the display-resolution frame instead).
+    uint32_t still_width;
+    uint32_t still_height;
+
     const cam_pipeline_camera_driver_t *camera_driver;
     const void *camera_config; // Opaque, passed to camera_driver->init()
 
@@ -113,6 +122,35 @@ void cam_pipeline_freeze(cam_pipeline_handle_t handle);
  * Resume normal streaming after freeze().
  */
 void cam_pipeline_unfreeze(cam_pipeline_handle_t handle);
+
+/* --- High-resolution still grab (P4 only) --- */
+
+/**
+ * True if this pipeline can produce a high-resolution still — i.e. still
+ * dimensions were configured, the SoC has a PPA, and the still buffer allocated.
+ * A consumer queries this to decide whether to request a still or fall back to
+ * latching a display-resolution frame.
+ */
+bool cam_pipeline_still_supported(cam_pipeline_handle_t handle);
+
+/**
+ * Request a one-shot high-resolution still. On its next NON-frozen frame, frame_cb
+ * runs a second PPA pass over the raw sensor frame (crop the central square, scale
+ * to the configured still size, apply the same rotation as the display path) into
+ * the dedicated still buffer, then marks it ready. Grab the still BEFORE freeze():
+ * frame_cb skips all processing while frozen, so a frozen pipeline never fills it.
+ * Idempotent; each call re-arms (a subsequent lock_still() returns the fresh grab).
+ * No-op if the pipeline has no still support.
+ */
+void cam_pipeline_request_still(cam_pipeline_handle_t handle);
+
+/**
+ * Return the still buffer once a requested grab has completed, else NULL. The
+ * pointer is the configured still_width x still_height RGB565 image and stays valid
+ * (and stable) until the next request_still() or destroy. No matching release —
+ * the still buffer is dedicated, not part of the display/consumer pool.
+ */
+const uint8_t *cam_pipeline_lock_still(cam_pipeline_handle_t handle);
 
 /* --- Display overlay --- */
 

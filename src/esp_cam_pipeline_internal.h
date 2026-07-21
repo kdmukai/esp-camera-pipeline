@@ -68,6 +68,16 @@ struct cam_pipeline {
     ppa_srm_rotation_angle_t ppa_angle;
 #endif
 
+    // High-resolution still grab (P4 only). A dedicated buffer, filled by a SECOND
+    // PPA pass in frame_cb when a consumer arms still_request. still_buffer stays
+    // NULL (and still_ready never sets) on boards without a PPA or when no still
+    // dimensions were configured — the consumer then latches a display frame.
+    uint8_t *still_buffer;         // still_w * still_h * 2 (RGB565), or NULL
+    size_t still_buffer_size;
+    uint32_t still_w, still_h;     // configured still dims (0 if disabled)
+    volatile bool still_request;   // consumer armed a grab
+    volatile bool still_ready;     // frame_cb filled still_buffer
+
 #ifdef CONFIG_CAM_PIPELINE_DEBUG
     // Per-stage metrics (atomic counters, safe across cores)
     volatile uint32_t camera_frames;
