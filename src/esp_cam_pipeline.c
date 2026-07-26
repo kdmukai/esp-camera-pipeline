@@ -167,6 +167,8 @@ static void grab_still(struct cam_pipeline *p, const uint8_t *camera_buf,
         .rotation_angle = p->ppa_angle,
         .scale_x = q_scale,
         .scale_y = q_scale,
+        .mirror_x = p->ppa_mirror_x,
+        .mirror_y = p->ppa_mirror_y,
         .mode = PPA_TRANS_MODE_BLOCKING,
     };
     if (ppa_do_scale_rotate_mirror(p->ppa_client, &srm) == ESP_OK) {
@@ -334,6 +336,8 @@ static void frame_cb(uint8_t *camera_buf, uint32_t camera_width,
             .rotation_angle = p->ppa_angle,
             .scale_x = q_scale,
             .scale_y = q_scale,
+            .mirror_x = p->ppa_mirror_x,
+            .mirror_y = p->ppa_mirror_y,
             .mode = PPA_TRANS_MODE_BLOCKING,
         };
         if (ppa_do_scale_rotate_mirror(p->ppa_client, &srm) != ESP_OK) {
@@ -566,6 +570,8 @@ cam_pipeline_create(const cam_pipeline_config_t *config) {
         case 270: p->ppa_angle = PPA_SRM_ROTATION_ANGLE_270; break;
         default:  p->ppa_angle = PPA_SRM_ROTATION_ANGLE_0;   break;
         }
+        p->ppa_mirror_x = config->mirror_x;
+        p->ppa_mirror_y = config->mirror_y;
     }
 #endif
 

@@ -22,6 +22,14 @@ typedef struct {
     uint32_t display_height; // Cropped frame height for display + consumers
     uint32_t rotation;       // PPA rotation in degrees: 0, 90, 180, 270 (P4 only)
 
+    // Optional mirror of the PPA output, applied in BOTH the display pass and the
+    // still pass (P4 only). Corrects a sensor that reads out reflected relative to
+    // the pipeline geometry — a handedness change a rotation cannot undo. Default
+    // false. Applied after scale+rotate, so mirror_x/mirror_y are the output
+    // (landscape display) horizontal/vertical axes.
+    bool mirror_x;
+    bool mirror_y;
+
     // Optional high-resolution still (P4 only). When non-zero AND the SoC has a
     // PPA, the pipeline allocates a dedicated still buffer and, on request_still(),
     // runs a SECOND PPA pass over the raw sensor frame into it (see request_still).
