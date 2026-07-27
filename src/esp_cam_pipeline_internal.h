@@ -66,6 +66,8 @@ struct cam_pipeline {
 #if SOC_PPA_SUPPORTED
     ppa_client_handle_t ppa_client;
     ppa_srm_rotation_angle_t ppa_angle;
+    bool ppa_mirror_x;
+    bool ppa_mirror_y;
 #endif
 
     // High-resolution still grab (P4 only). A dedicated buffer, filled by a SECOND
