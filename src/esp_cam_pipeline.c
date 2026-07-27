@@ -117,34 +117,53 @@ static void log_debug_metrics(struct cam_pipeline *p) {
 
 #if SOC_PPA_SUPPORTED
 /*
- * Second PPA pass: crop the central SQUARE of the raw sensor frame and
- * scale+rotate it into the dedicated still buffer at still_w x still_h. Same
- * fill-cover math as the display pass, but the target is a square, so the height
- * binds (the sensor is landscape) and the excess width is centre-cropped —
- * yielding the sensor's square field of view at the configured resolution, in the
- * same orientation as the on-screen preview. For a still equal to the sensor
- * height this is a pure 1:1 centre-crop (scale 1.0); a smaller still scales it
- * down. Runs once per request_still(), from frame_cb, on the same camera_buf the
- * display just used (so the still matches what the user is looking at).
+ * Second PPA pass: crop the raw sensor frame, then scale+rotate it into the
+ * dedicated still buffer at still_w x still_h, in the SAME orientation as the
+ * on-screen preview (it applies the same ppa_angle). Rotation-aware like the
+ * display pass: a 90/270° rotation swaps the output axes, so the crop is computed
+ * against the still dims mapped back into sensor space. Fill-cover: the axis with
+ * the larger target/source ratio binds and the excess on the other axis is centre-
+ * cropped — so a still whose (rotation-adjusted) aspect matches the sensor grabs
+ * the FULL field of view with no crop, and a differently-shaped one centre-crops.
+ * Runs once per request_still(), from frame_cb, on the same camera_buf the display
+ * just used (so the still matches what the user is looking at).
  */
 static void grab_still(struct cam_pipeline *p, const uint8_t *camera_buf,
                        uint32_t camera_width, uint32_t camera_height) {
     uint32_t sw = p->still_w;
     uint32_t sh = p->still_h;
 
-    /* Fill-cover: the larger of the two ratios covers the square target and
-     * crops the overflow off the long (width) axis. Quantize UP to a PPA-
-     * representable 4-bit fractional scale so the output is >= the target, then
-     * clip to exactly still_w x still_h. */
-    float scx = (float)sw / camera_width;
-    float scy = (float)sh / camera_height;
+    /* PPA is crop → scale → rotate: a 90/270° rotation swaps the output axes, so
+     * compute the crop/scale against the still dims mapped back into sensor space —
+     * exactly as the display pass does. Without this, a non-square still on a 90/270
+     * board sizes the crop to the wrong axis and the grab fails the PPA fit check. */
+    bool swap = (p->ppa_angle == PPA_SRM_ROTATION_ANGLE_90 ||
+                 p->ppa_angle == PPA_SRM_ROTATION_ANGLE_270);
+    uint32_t target_w = swap ? sh : sw;
+    uint32_t target_h = swap ? sw : sh;
+
+    /* Fill-cover: the larger of the two ratios covers the target and the excess on
+     * the other axis is centre-cropped. Quantize UP to a PPA-representable 4-bit
+     * fractional scale so the output is >= the target, then clip to still_w x still_h. */
+    float scx = (float)target_w / camera_width;
+    float scy = (float)target_h / camera_height;
     float scale = (scx > scy) ? scx : scy;
     float q_scale = ceilf(scale * 16.0f) / 16.0f;
 
-    uint32_t in_w = (uint32_t)ceilf((float)sw / q_scale);
-    uint32_t in_h = (uint32_t)ceilf((float)sh / q_scale);
+    uint32_t in_w = (uint32_t)ceilf((float)target_w / q_scale);
+    uint32_t in_h = (uint32_t)ceilf((float)target_h / q_scale);
     if (in_w > camera_width)  in_w = camera_width;
     if (in_h > camera_height) in_h = camera_height;
+    /* ppa_srm rejects the op unless the scaled input block fits the output pic:
+     * it requires (scale * in_block) <= out.pic (esp_driver_ppa/src/ppa_srm.c). The
+     * ceilf() above can round in_w/in_h up just enough that q_scale*in exceeds the
+     * target by ~1px, so ppa_do_scale_rotate_mirror returns ESP_ERR_INVALID_ARG
+     * ("scale does not fit in the out pic") and the grab silently fails — still_ready
+     * never sets, so the entropy consumer polls lock_still() forever and the capture
+     * hangs. Trim to the sensor-space target so the scaled block always fits. Bites
+     * mainly on upscales (q_scale > 1). */
+    while (in_w > 1 && (uint32_t)(q_scale * (float)in_w) > target_w) in_w--;
+    while (in_h > 1 && (uint32_t)(q_scale * (float)in_h) > target_h) in_h--;
     uint32_t off_x = (camera_width - in_w) / 2;
     uint32_t off_y = (camera_height - in_h) / 2;
 
